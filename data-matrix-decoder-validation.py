@@ -259,6 +259,11 @@ class LiveDmtxEvaluator:
         self._ui = UiState(overlay="READY")
 
         self._stop_event = threading.Event()
+
+        # Gate evaluation until at least one camera frame has been captured.
+        # This prevents early "NO FRAME" logs during camera warm-up / UI startup.
+        self._frame_ready = threading.Event()
+
         self._worker = threading.Thread(target=self._evaluation_worker, daemon=True)
 
         self._dmtx = DmtxHardTimeoutWorker()
@@ -323,6 +328,8 @@ class LiveDmtxEvaluator:
 
     def start(self) -> None:
         self._open_csv()
+        # Start evaluation worker first, but it will block on _frame_ready until
+        # the UI loop captures the first frame.
         self._worker.start()
         self._run_ui_loop()
 
@@ -417,7 +424,15 @@ class LiveDmtxEvaluator:
         self._csv_fh.flush()
 
     def _evaluation_worker(self) -> None:
-        """Runs the 10x attempts, each with 20 decode cycles, at fixed decode interval."""
+        """Runs the N attempts, each with M decode cycles, at fixed decode interval.
+
+        Evaluation is gated on the first captured frame to avoid early NO FRAME.
+        """
+
+        # Wait for at least one valid frame before starting attempts.
+        while not self._stop_event.is_set():
+            if self._frame_ready.wait(timeout=0.1):
+                break
 
         next_t = time.monotonic()
         for attempt in range(1, self.attempts + 1):
@@ -438,27 +453,17 @@ class LiveDmtxEvaluator:
                 if now < next_t:
                     time.sleep(min(0.01, next_t - now))
                 next_t = max(next_t, time.monotonic()) + self.decode_interval_s
-
                 # obtain latest frame snapshot
                 with self._frame_lock:
                     frame = None if self._latest_frame is None else self._latest_frame.copy()
 
                 if frame is None:
-                    # no frame yet; count as wrong
-                    ts = time.time()
-                    self._log_decode(
-                        attempt_i=attempt,
-                        decode_i=di,
-                        ts=ts,
-                        decode_ms=0.0,
-                        payload="NO FRAME",
-                        timed_out=False,
-                        is_match=False,
-                    )
-                    print(f"[attempt {attempt}/{self.attempts} | {di:02d}/{self.decodes_per_attempt}] 0.0 ms | NO FRAME")
+                    # Frame not available yet (should be rare after gating).
+                    # Do NOT consume a decode slot; wait until next interval.
                     self._set_overlay(
-                        f"ATTEMPT {attempt}/{self.attempts} | {di}/{self.decodes_per_attempt} | MATCHES {matches} | RUNNING"
+                        f"ATTEMPT {attempt}/{self.attempts} | {di-1}/{self.decodes_per_attempt} | MATCHES {matches} | WAITING FOR FRAME"
                     )
+                    next_t = time.monotonic() + self.decode_interval_s
                     continue
 
                 fh, fw = frame.shape[:2]
@@ -550,6 +555,10 @@ class LiveDmtxEvaluator:
 
             with self._frame_lock:
                 self._latest_frame = frame
+
+            # Signal that at least one valid frame has been captured.
+            if not self._frame_ready.is_set():
+                self._frame_ready.set()
 
             fh, fw = frame.shape[:2]
             x0, y0, x1, y1 = self._get_roi_for_frame(fw, fh)
