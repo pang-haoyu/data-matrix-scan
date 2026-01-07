@@ -265,10 +265,10 @@ class LiveDmtxDecoder:
             x0, y0, x1, y1 = self.roi_pixels
             return clamp_roi(x0, y0, x1, y1, frame_w, frame_h)
 
-        x0 = int(frame_w * 0.47)
-        y0 = int(frame_h * 0.47)
-        x1 = int(frame_w * 0.53)
-        y1 = int(frame_h * 0.53)
+        x0 = int(frame_w * 0.43)
+        y0 = int(frame_h * 0.43)
+        x1 = int(frame_w * 0.57)
+        y1 = int(frame_h * 0.57)
         return clamp_roi(x0, y0, x1, y1, frame_w, frame_h)
 
     def _decode_worker(self) -> None:
@@ -382,7 +382,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--camera-id", type=int, default=0)
     p.add_argument("--decode-interval-ms", type=int, default=250)
-    p.add_argument("--decode-timeout-ms", type=int, default=150)
+    p.add_argument("--decode-timeout-ms", type=int, default=300)
     p.add_argument("--max-symbols", type=int, default=1)
     p.add_argument("--roi", type=parse_roi_arg, default=None)
     p.add_argument("--log-images", type=int, default=0)
