@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import multiprocessing as mp
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -21,6 +23,22 @@ class DecodeState:
     text: str = "NO READ"
     rect: Optional[Rect] = None
     updated_at: float = 0.0
+
+
+@dataclass
+class ValidationState:
+    """Mutable state for the ongoing timing experiment."""
+
+    enabled: bool = False
+    target: str = ""
+    matches_per_validation: int = 3
+    validations_required: int = 10
+
+    current_validation_index: int = 1  # 1-based
+    current_match_count: int = 0
+
+    start_monotonic: Optional[float] = None
+    start_wall_s: Optional[float] = None
 
 
 def fourcc_to_str(fourcc_int: int) -> str:
@@ -179,6 +197,10 @@ class LiveDmtxDecoder:
         roi: Optional[Tuple[int, int, int, int]] = None,
         log_images: int = 0,
         log_dir: str = "logs",
+        validation_target: Optional[str] = None,
+        matches_per_validation: int = 3,
+        validations_required: int = 10,
+        csv_path: str = "validation_timings.csv",
     ) -> None:
         self.camera_id = camera_id
         self.decode_interval_s = decode_interval_s
@@ -209,6 +231,56 @@ class LiveDmtxDecoder:
         self._worker = threading.Thread(target=self._decode_worker, daemon=True)
 
         self._dmtx = DmtxHardTimeoutWorker()
+
+        # Timing / validation experiment (optional)
+        self._val_lock = threading.Lock()
+        if validation_target is not None:
+            if not str(validation_target).strip():
+                raise ValueError("--target must be a non-empty string")
+            if int(matches_per_validation) <= 0:
+                raise ValueError("--matches-per-validation must be > 0")
+            if int(validations_required) <= 0:
+                raise ValueError("--validations must be > 0")
+
+            self._validation = ValidationState(
+                enabled=True,
+                target=str(validation_target).strip(),
+                matches_per_validation=int(matches_per_validation),
+                validations_required=int(validations_required),
+            )
+
+            self._csv_path = Path(csv_path)
+            self._csv_path.parent.mkdir(parents=True, exist_ok=True)
+            self._csv_fh = self._csv_path.open("w", newline="")
+            self._csv_writer = csv.DictWriter(
+                self._csv_fh,
+                fieldnames=[
+                    "validation_index",
+                    "target",
+                    "matches_per_validation",
+                    "decode_interval_ms",
+                    "decode_timeout_ms",
+                    "start_time_iso",
+                    "end_time_iso",
+                    "duration_ms",
+                ],
+            )
+            self._csv_writer.writeheader()
+            self._csv_fh.flush()
+
+            print(
+                "[timing] Enabled: target={!r}, matches_per_validation={}, validations_required={}, csv={}".format(
+                    self._validation.target,
+                    self._validation.matches_per_validation,
+                    self._validation.validations_required,
+                    str(self._csv_path),
+                )
+            )
+        else:
+            self._validation = ValidationState(enabled=False)
+            self._csv_path = None
+            self._csv_fh = None
+            self._csv_writer = None
 
     def _negotiate_highest_resolution(self) -> None:
         candidates = [
@@ -254,6 +326,12 @@ class LiveDmtxDecoder:
                 self._worker.join(timeout=1.0)
         finally:
             try:
+                if getattr(self, "_csv_fh", None) is not None:
+                    self._csv_fh.flush()
+                    self._csv_fh.close()
+            except Exception:
+                pass
+            try:
                 self._dmtx.close()
             except Exception:
                 pass
@@ -284,6 +362,13 @@ class LiveDmtxDecoder:
                 if self._latest_frame is None:
                     continue
                 frame = self._latest_frame.copy()
+
+            # Timing experiment: start the timer only once we know we have a valid frame.
+            if self._validation.enabled:
+                with self._val_lock:
+                    if self._validation.start_monotonic is None:
+                        self._validation.start_monotonic = time.monotonic()
+                        self._validation.start_wall_s = time.time()
 
             fh, fw = frame.shape[:2]
             x0, y0, x1, y1 = self._get_roi_for_frame(fw, fh)
@@ -322,6 +407,61 @@ class LiveDmtxDecoder:
                     self._state.text = text
                     self._state.rect = rect_full
                     self._state.updated_at = time.time()
+
+                # Timing experiment: count only exact matches against target.
+                if self._validation.enabled and text.strip() == self._validation.target:
+                    with self._val_lock:
+                        self._validation.current_match_count += 1
+                        m = self._validation.current_match_count
+                        k = self._validation.matches_per_validation
+                        vidx = self._validation.current_validation_index
+                        vreq = self._validation.validations_required
+                        start_m = self._validation.start_monotonic
+                        start_wall = self._validation.start_wall_s
+
+                    # Keep progress visible but lightweight.
+                    if start_m is not None:
+                        elapsed_s = time.monotonic() - start_m
+                        print(
+                            f"[timing] Validation {vidx}/{vreq}: match {m}/{k} | elapsed={elapsed_s:.3f}s"
+                        )
+
+                    if m >= k and start_m is not None and start_wall is not None:
+                        end_wall = time.time()
+                        duration_ms = (time.monotonic() - start_m) * 1000.0
+                        row = {
+                            "validation_index": vidx,
+                            "target": self._validation.target,
+                            "matches_per_validation": k,
+                            "decode_interval_ms": int(round(self.decode_interval_s * 1000.0)),
+                            "decode_timeout_ms": int(self.decode_timeout_ms),
+                            "start_time_iso": datetime.fromtimestamp(start_wall).isoformat(timespec="seconds"),
+                            "end_time_iso": datetime.fromtimestamp(end_wall).isoformat(timespec="seconds"),
+                            "duration_ms": f"{duration_ms:.1f}",
+                        }
+
+                        try:
+                            if self._csv_writer is not None and self._csv_fh is not None:
+                                self._csv_writer.writerow(row)
+                                self._csv_fh.flush()
+                        except Exception as e:
+                            print(f"[timing] WARNING: failed to write CSV row: {e}")
+
+                        print(
+                            f"[timing] SUCCESS validation {vidx}/{vreq}: {duration_ms:.1f} ms (target={self._validation.target!r})"
+                        )
+
+                        # Prepare next validation, or stop if complete.
+                        with self._val_lock:
+                            self._validation.current_validation_index += 1
+                            self._validation.current_match_count = 0
+                            self._validation.start_monotonic = None
+                            self._validation.start_wall_s = None
+                            done = self._validation.current_validation_index > self._validation.validations_required
+
+                        if done:
+                            print(f"[timing] Completed {vreq} validations. Terminating.")
+                            self._stop_event.set()
             else:
                 print(f"[decode] {decode_ms:.1f} ms | NO READ")
                 with self._state_lock:
@@ -387,11 +527,39 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--roi", type=parse_roi_arg, default=None)
     p.add_argument("--log-images", type=int, default=0)
     p.add_argument("--log-dir", type=str, default="logs")
+
+    # Timing / validation experiment arguments (optional).
+    # If --target is provided, the script will run timing validations and terminate automatically.
+    p.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help="Target payload value. If set, timing validation mode is enabled.",
+    )
+    p.add_argument(
+        "--matches-per-validation",
+        type=int,
+        default=3,
+        help="Number of correct target decodes required per successful validation (default: 3).",
+    )
+    p.add_argument(
+        "--validations",
+        type=int,
+        default=10,
+        help="Number of successful validations to collect before terminating (default: 10).",
+    )
+    p.add_argument(
+        "--csv",
+        type=str,
+        default="validation_timings.csv",
+        help="CSV output path for timing results (default: validation_timings.csv).",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
     decoder = LiveDmtxDecoder(
         camera_id=args.camera_id,
         decode_interval_s=max(0.01, args.decode_interval_ms / 1000.0),
@@ -400,6 +568,10 @@ def main() -> None:
         roi=args.roi,
         log_images=args.log_images,
         log_dir=args.log_dir,
+        validation_target=args.target,
+        matches_per_validation=max(1, int(args.matches_per_validation)),
+        validations_required=max(1, int(args.validations)),
+        csv_path=str(args.csv),
     )
     try:
         decoder.start()
