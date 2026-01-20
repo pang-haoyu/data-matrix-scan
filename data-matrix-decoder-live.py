@@ -195,6 +195,9 @@ class LiveDmtxDecoder:
         max_symbols: int = 1,
         window_name: str = "Live Data Matrix Decoder",
         roi: Optional[Tuple[int, int, int, int]] = None,
+        clahe: bool = True,
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_grid: int = 8,
         log_images: int = 0,
         log_dir: str = "logs",
         validation_target: Optional[str] = None,
@@ -208,6 +211,25 @@ class LiveDmtxDecoder:
         self.max_symbols = max_symbols
         self.window_name = window_name
         self.roi_pixels = roi
+
+        # CLAHE (Contrast Limited Adaptive Histogram Equalization) is a pragmatic
+        # preprocessing step for Data Matrix, especially when illumination is uneven.
+        # We apply it to the grayscale ROI before decoding.
+        self.clahe_enabled = bool(clahe)
+        self.clahe_clip_limit = float(clahe_clip_limit)
+        self.clahe_tile_grid = int(clahe_tile_grid)
+        if self.clahe_clip_limit <= 0:
+            raise ValueError("--clahe-clip-limit must be > 0")
+        if self.clahe_tile_grid <= 0:
+            raise ValueError("--clahe-tile-grid must be > 0")
+        self._clahe = (
+            cv2.createCLAHE(
+                clipLimit=self.clahe_clip_limit,
+                tileGridSize=(self.clahe_tile_grid, self.clahe_tile_grid),
+            )
+            if self.clahe_enabled
+            else None
+        )
 
         self.log_images_remaining = max(0, int(log_images))
         self.log_dir = Path(log_dir)
@@ -310,9 +332,14 @@ class LiveDmtxDecoder:
 
         fps = self._cap.get(cv2.CAP_PROP_FPS)
         fourcc = int(self._cap.get(cv2.CAP_PROP_FOURCC))
+        clahe_str = (
+            f"clahe=on(clip={self.clahe_clip_limit:g}, tile={self.clahe_tile_grid}x{self.clahe_tile_grid})"
+            if self._clahe is not None
+            else "clahe=off"
+        )
         print(
             f"Camera: {chosen[0]}x{chosen[1]} @ {fps:.1f} fps ({fourcc_to_str(fourcc)}) | "
-            f"decode_timeout={self.decode_timeout_ms}ms"
+            f"decode_timeout={self.decode_timeout_ms}ms | {clahe_str}"
         )
 
     def start(self) -> None:
@@ -373,13 +400,24 @@ class LiveDmtxDecoder:
             fh, fw = frame.shape[:2]
             x0, y0, x1, y1 = self._get_roi_for_frame(fw, fh)
             roi = frame[y0:y1, x0:x1]
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            raw_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = raw_gray
+
+            # Apply CLAHE to the cropped grayscale ROI before decoding.
+            if self._clahe is not None:
+                try:
+                    gray = self._clahe.apply(raw_gray)
+                except Exception:
+                    # If CLAHE fails for any reason, fall back to the raw grayscale ROI.
+                    gray = raw_gray
 
             if self.log_images_remaining > 0:
                 idx = self.log_images_remaining
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 cv2.imwrite(str(self.log_dir / f"{ts}_roi_color_{idx:04d}.png"), roi)
-                cv2.imwrite(str(self.log_dir / f"{ts}_roi_gray_{idx:04d}.png"), gray)
+                cv2.imwrite(str(self.log_dir / f"{ts}_roi_gray_{idx:04d}.png"), raw_gray)
+                if self._clahe is not None:
+                    cv2.imwrite(str(self.log_dir / f"{ts}_roi_gray_clahe_{idx:04d}.png"), gray)
                 self.log_images_remaining -= 1
 
             t0 = time.perf_counter()
@@ -525,6 +563,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decode-timeout-ms", type=int, default=300)
     p.add_argument("--max-symbols", type=int, default=1)
     p.add_argument("--roi", type=parse_roi_arg, default=None)
+
+    # Image preprocessing for improved decode robustness.
+    # CLAHE is enabled by default; use --no-clahe to disable.
+    p.add_argument(
+        "--clahe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply CLAHE (contrast enhancement) to the ROI before decoding (default: on).",
+    )
+    p.add_argument(
+        "--clahe-clip-limit",
+        type=float,
+        default=2.0,
+        help="CLAHE clip limit (higher increases contrast; default: 2.0).",
+    )
+    p.add_argument(
+        "--clahe-tile-grid",
+        type=int,
+        default=8,
+        help="CLAHE tile grid size N (applied as NxN; default: 8).",
+    )
     p.add_argument("--log-images", type=int, default=0)
     p.add_argument("--log-dir", type=str, default="logs")
 
@@ -566,6 +625,9 @@ def main() -> None:
         decode_timeout_ms=max(1, args.decode_timeout_ms),
         max_symbols=max(1, args.max_symbols),
         roi=args.roi,
+        clahe=bool(args.clahe),
+        clahe_clip_limit=float(args.clahe_clip_limit),
+        clahe_tile_grid=int(args.clahe_tile_grid),
         log_images=args.log_images,
         log_dir=args.log_dir,
         validation_target=args.target,
