@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 from __future__ import annotations
 
 import argparse
@@ -15,13 +14,30 @@ from typing import Optional, Tuple
 import cv2
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 
+def apply_inner_crop(img, frac):
+    if frac >= 0.999:
+        return img
+    h, w = img.shape[:2]
+    frac = max(0.1, min(1.0, frac))
+    new_w = int(w * frac)
+    new_h = int(h * frac)
+    x0 = (w - new_w) // 2
+    y0 = (h - new_h) // 2
+    return img[y0:y0 + new_h, x0:x0 + new_w]
+
+
+
+
+
 Rect = Tuple[int, int, int, int]
+Poly = Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int], Tuple[int, int]]
 
 
 @dataclass
 class DecodeState:
     text: str = "NO READ"
     rect: Optional[Rect] = None
+    roi_poly: Optional[Poly] = None
     updated_at: float = 0.0
 
 
@@ -55,6 +71,133 @@ def clamp_roi(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> Tuple[int, 
     if y1 <= y0 + 1:
         y1 = min(h, y0 + 2)
     return x0, y0, x1, y1
+
+
+def _order_points_tl_tr_br_bl(pts) -> "cv2.typing.MatLike":
+    """Order 4 (x,y) points as TL, TR, BR, BL."""
+    import numpy as np
+
+    pts = np.asarray(pts, dtype=np.float32)
+    if pts.shape != (4, 2):
+        raise ValueError("Expected (4,2) points")
+
+    s = pts.sum(axis=1)
+    d = pts[:, 0] - pts[:, 1]
+
+    tl = pts[int(s.argmin())]
+    br = pts[int(s.argmax())]
+    tr = pts[int(d.argmax())]
+    bl = pts[int(d.argmin())]
+    return np.stack([tl, tr, br, bl], axis=0)
+
+
+def _choose_inner_corner(marker_corners, img_center_xy) -> Tuple[float, float]:
+    """Return the marker corner closest to the image center.
+
+    This mirrors the pragmatic heuristic in the reference capture code: when four
+    markers surround a region, the corner facing inward tends to be the corner
+    closest to the image center.
+    """
+    import numpy as np
+
+    corners = np.asarray(marker_corners, dtype=np.float32).reshape(-1, 2)
+    cxy = np.asarray(img_center_xy, dtype=np.float32).reshape(1, 2)
+    d2 = ((corners - cxy) ** 2).sum(axis=1)
+    idx = int(d2.argmin())
+    x, y = corners[idx]
+    return float(x), float(y)
+
+
+def _poly_area(quad_xy) -> float:
+    """Signed polygon area (absolute value used by callers)."""
+    import numpy as np
+
+    p = np.asarray(quad_xy, dtype=np.float32).reshape(-1, 2)
+    if p.shape[0] < 3:
+        return 0.0
+    x = p[:, 0]
+    y = p[:, 1]
+    return float(0.5 * abs((x * np.roll(y, -1) - y * np.roll(x, -1)).sum()))
+
+
+def _marker_area(marker_corners) -> float:
+    import numpy as np
+
+    c = np.asarray(marker_corners, dtype=np.float32).reshape(-1, 2)
+    return _poly_area(c)
+
+
+def detect_aruco_roi_warp(frame_bgr, min_marker_area: float = 500.0):
+    """Detect 4 ArUco markers and return (warped_bgr, poly_tl_tr_br_bl).
+
+    - Uses DICT_4X4_50.
+    - Picks up to 4 largest markers by area (after min area filtering).
+    - Uses the marker corner closest to image center as the "inner" corner.
+    - Orders the 4 inner corners TL/TR/BR/BL and warps via perspective transform.
+
+    Returns (warped_bgr, poly) or (None, None) if detection fails.
+    """
+    if not hasattr(cv2, "aruco"):
+        raise RuntimeError(
+            "OpenCV ArUco module not available (cv2.aruco). Install opencv-contrib-python."
+        )
+
+    import numpy as np
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    aruco = cv2.aruco
+    dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+    params = aruco.DetectorParameters()
+    detector = aruco.ArucoDetector(dictionary, params)
+
+    corners, ids, _ = detector.detectMarkers(gray)
+    if ids is None or len(corners) < 4:
+        return None, None
+
+    # Keep only markers above area threshold.
+    items = []
+    for c, mid in zip(corners, ids.flatten().tolist()):
+        a = _marker_area(c)
+        if a >= float(min_marker_area):
+            items.append((a, mid, c))
+    if len(items) < 4:
+        return None, None
+
+    # Pick the four largest.
+    items.sort(key=lambda t: t[0], reverse=True)
+    items = items[:4]
+
+    h, w = gray.shape[:2]
+    img_center = (w * 0.5, h * 0.5)
+    inner_pts = [_choose_inner_corner(c, img_center) for (_a, _mid, c) in items]
+
+    try:
+        quad = _order_points_tl_tr_br_bl(inner_pts)
+    except Exception:
+        return None, None
+
+    if _poly_area(quad) < 200.0:
+        return None, None
+
+    # Natural output size derived from geometry.
+    def _dist(p, q):
+        return float(np.linalg.norm(np.asarray(p) - np.asarray(q)))
+
+    tl, tr, br, bl = quad
+    width = max(_dist(tl, tr), _dist(bl, br))
+    height = max(_dist(tl, bl), _dist(tr, br))
+    out_w = int(max(32, min(2048, round(width))))
+    out_h = int(max(32, min(2048, round(height))))
+
+    dst = np.array(
+        [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
+        dtype=np.float32,
+    )
+    M = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
+    warped = cv2.warpPerspective(frame_bgr, M, (out_w, out_h), flags=cv2.INTER_LINEAR)
+
+    poly = tuple((int(round(x)), int(round(y))) for x, y in quad.tolist())
+    return warped, poly
 
 
 class DmtxHardTimeoutWorker:
@@ -195,9 +338,13 @@ class LiveDmtxDecoder:
         max_symbols: int = 1,
         window_name: str = "Live Data Matrix Decoder",
         roi: Optional[Tuple[int, int, int, int]] = None,
-        clahe: bool = True,
+        use_aruco_roi: bool = False,
+        inner_crop: float = 1.0,
+        clahe: bool = False,
         clahe_clip_limit: float = 2.0,
         clahe_tile_grid: int = 8,
+        upscale_factor: float = 1.0,
+        use_threshold: bool = False,
         log_images: int = 0,
         log_dir: str = "logs",
         validation_target: Optional[str] = None,
@@ -212,9 +359,29 @@ class LiveDmtxDecoder:
         self.window_name = window_name
         self.roi_pixels = roi
 
+        self.use_aruco_roi = bool(use_aruco_roi)
+
+        self.inner_crop = float(inner_crop)
+        # Clamp to a safe range; <1.0 crops inward, 1.0 disables.
+        if self.inner_crop < 0.1 or self.inner_crop > 1.0:
+            raise ValueError('--inner-crop must be between 0.1 and 1.0')
+
+        # Optional preprocessing (all OFF by default).
+        self.upscale_factor = float(upscale_factor)
+        if self.upscale_factor <= 0:
+            raise ValueError("--upscale must be > 0")
+        self.use_threshold = bool(use_threshold)
+
+        # ArUco ROI fallback (internal constants; no CLI surface area).
+        self._aruco_min_marker_area = 500.0
+        self._aruco_hold_s = 1.0
+        self._last_aruco_warped = None
+        self._last_aruco_poly: Optional[Poly] = None
+        self._last_aruco_ok_monotonic: float = 0.0
+
         # CLAHE (Contrast Limited Adaptive Histogram Equalization) is a pragmatic
         # preprocessing step for Data Matrix, especially when illumination is uneven.
-        # We apply it to the grayscale ROI before decoding.
+        # Disabled by default; enabled only if requested.
         self.clahe_enabled = bool(clahe)
         self.clahe_clip_limit = float(clahe_clip_limit)
         self.clahe_tile_grid = int(clahe_tile_grid)
@@ -398,18 +565,90 @@ class LiveDmtxDecoder:
                         self._validation.start_wall_s = time.time()
 
             fh, fw = frame.shape[:2]
-            x0, y0, x1, y1 = self._get_roi_for_frame(fw, fh)
-            roi = frame[y0:y1, x0:x1]
+            # ROI selection: either fixed pixel ROI (default) or ArUco-derived ROI.
+            roi_poly: Optional[Poly] = None
+            roi_bgr = None
+            x0 = y0 = 0
+
+            if self.use_aruco_roi:
+                warped, poly = detect_aruco_roi_warp(frame, min_marker_area=self._aruco_min_marker_area)
+                if warped is not None and poly is not None:
+                    roi_bgr = warped
+                    roi_bgr = apply_inner_crop(roi_bgr, self.inner_crop)
+                    roi_poly = poly
+                    self._last_aruco_warped = warped
+                    self._last_aruco_poly = poly
+                    self._last_aruco_ok_monotonic = time.monotonic()
+                else:
+                    # Short hold to tolerate transient marker dropouts.
+                    if (
+                        self._last_aruco_warped is not None
+                        and self._last_aruco_poly is not None
+                        and (time.monotonic() - self._last_aruco_ok_monotonic) <= self._aruco_hold_s
+                    ):
+                        roi_bgr = self._last_aruco_warped
+                        roi_poly = self._last_aruco_poly
+
+                # Publish the ROI polygon (or None) for the UI.
+                with self._state_lock:
+                    self._state.roi_poly = roi_poly
+
+                if roi_bgr is None:
+                    # No ROI available: skip this decode cycle.
+                    with self._state_lock:
+                        self._state.text = "NO ROI"
+                        self._state.rect = None
+                        self._state.updated_at = time.time()
+                    continue
+            else:
+                x0, y0, x1, y1 = self._get_roi_for_frame(fw, fh)
+                roi_bgr = frame[y0:y1, x0:x1]
+                # Fixed ROI rectangle as a polygon for consistent overlay handling.
+                roi_poly = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+                with self._state_lock:
+                    self._state.roi_poly = roi_poly
+
+            roi = roi_bgr
             raw_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             gray = raw_gray
+            gray_after_clahe = None
 
-            # Apply CLAHE to the cropped grayscale ROI before decoding.
+            # Upscale (optional; default off).
+            if self.upscale_factor != 1.0:
+                try:
+                    gray = cv2.resize(
+                        gray,
+                        None,
+                        fx=self.upscale_factor,
+                        fy=self.upscale_factor,
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                except Exception:
+                    gray = raw_gray
+
+            # Apply CLAHE to the grayscale ROI before decoding (optional; default off).
             if self._clahe is not None:
                 try:
-                    gray = self._clahe.apply(raw_gray)
+                    gray = self._clahe.apply(gray)
+                    gray_after_clahe = gray
                 except Exception:
-                    # If CLAHE fails for any reason, fall back to the raw grayscale ROI.
+                    # If CLAHE fails for any reason, fall back to the unprocessed grayscale ROI.
                     gray = raw_gray
+
+            # Dynamic thresholding (optional; default off).
+            if self.use_threshold:
+                try:
+                    # Adaptive Gaussian threshold with conservative defaults.
+                    gray = cv2.adaptiveThreshold(
+                        gray,
+                        255,
+                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                        cv2.THRESH_BINARY,
+                        31,
+                        5,
+                    )
+                except Exception:
+                    pass
 
             if self.log_images_remaining > 0:
                 idx = self.log_images_remaining
@@ -417,7 +656,12 @@ class LiveDmtxDecoder:
                 cv2.imwrite(str(self.log_dir / f"{ts}_roi_color_{idx:04d}.png"), roi)
                 cv2.imwrite(str(self.log_dir / f"{ts}_roi_gray_{idx:04d}.png"), raw_gray)
                 if self._clahe is not None:
-                    cv2.imwrite(str(self.log_dir / f"{ts}_roi_gray_clahe_{idx:04d}.png"), gray)
+                    cv2.imwrite(
+                        str(self.log_dir / f"{ts}_roi_gray_clahe_{idx:04d}.png"),
+                        gray_after_clahe if gray_after_clahe is not None else gray,
+                    )
+                if self.use_threshold:
+                    cv2.imwrite(str(self.log_dir / f"{ts}_roi_gray_thresh_{idx:04d}.png"), gray)
                 self.log_images_remaining -= 1
 
             t0 = time.perf_counter()
@@ -436,7 +680,10 @@ class LiveDmtxDecoder:
 
             if text:
                 rect_full = None
-                if rect_roi is not None:
+                # For fixed ROI we can map rect back into full-frame coordinates.
+                # For ArUco-warped ROIs, rect is in warped coordinates; we do not
+                # back-project it to full-frame to keep complexity minimal.
+                if (not self.use_aruco_roi) and rect_roi is not None:
                     left, top, width, height = rect_roi
                     rect_full = (int(left) + x0, int(top) + y0, int(width), int(height))
 
@@ -519,13 +766,20 @@ class LiveDmtxDecoder:
                 self._latest_frame = frame
 
             fh, fw = frame.shape[:2]
-            x0, y0, x1, y1 = self._get_roi_for_frame(fw, fh)
 
             with self._state_lock:
                 text = self._state.text
                 rect = self._state.rect
+                roi_poly = self._state.roi_poly
 
-            cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 255, 0), 2)
+            # Draw ROI overlay.
+            if roi_poly is not None:
+                try:
+                    pts = [(int(x), int(y)) for (x, y) in roi_poly]
+                    for i in range(4):
+                        cv2.line(frame, pts[i], pts[(i + 1) % 4], (255, 255, 0), 2)
+                except Exception:
+                    pass
 
             if rect is not None:
                 x, y, w, h = rect
@@ -564,25 +818,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-symbols", type=int, default=1)
     p.add_argument("--roi", type=parse_roi_arg, default=None)
 
-    # Image preprocessing for improved decode robustness.
-    # CLAHE is enabled by default; use --no-clahe to disable.
+    # ROI selection
+    p.add_argument(
+        "--aruco",
+        action="store_true",
+        help="Use four ArUco markers in the frame as the ROI corners (default: off).",
+    )
+    p.add_argument(
+        "--inner-crop",
+        type=float,
+        default=1.0,
+        help="Secondary center crop fraction applied after ArUco warp (e.g. 0.8 keeps the center 80%). Default 1.0 (disabled).",
+    )
+
+
+    # Optional preprocessing (all OFF by default).
     p.add_argument(
         "--clahe",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Apply CLAHE (contrast enhancement) to the ROI before decoding (default: on).",
+        action="store_true",
+        help="Enable CLAHE (contrast enhancement) on the ROI before decoding (default: off).",
     )
     p.add_argument(
-        "--clahe-clip-limit",
+        "--threshold",
+        action="store_true",
+        help="Enable dynamic thresholding on the ROI before decoding (default: off).",
+    )
+    p.add_argument(
+        "--upscale",
         type=float,
-        default=2.0,
-        help="CLAHE clip limit (higher increases contrast; default: 2.0).",
-    )
-    p.add_argument(
-        "--clahe-tile-grid",
-        type=int,
-        default=8,
-        help="CLAHE tile grid size N (applied as NxN; default: 8).",
+        default=1.0,
+        help="Upscale factor for ROI prior to decoding (default: 1.0 = off).",
     )
     p.add_argument("--log-images", type=int, default=0)
     p.add_argument("--log-dir", type=str, default="logs")
@@ -625,9 +890,11 @@ def main() -> None:
         decode_timeout_ms=max(1, args.decode_timeout_ms),
         max_symbols=max(1, args.max_symbols),
         roi=args.roi,
+        use_aruco_roi=bool(args.aruco),
+        inner_crop=float(args.inner_crop),
         clahe=bool(args.clahe),
-        clahe_clip_limit=float(args.clahe_clip_limit),
-        clahe_tile_grid=int(args.clahe_tile_grid),
+        upscale_factor=float(args.upscale),
+        use_threshold=bool(args.threshold),
         log_images=args.log_images,
         log_dir=args.log_dir,
         validation_target=args.target,
