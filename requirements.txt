@@ -1,0 +1,5 @@
+numpy==2.4.1
+opencv_python==4.13.0.90
+Pillow==12.1.0
+pylibdmtx==0.1.10
+reportlab==4.4.9
